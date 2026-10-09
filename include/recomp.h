@@ -424,6 +424,10 @@ typedef struct {
     uint32_t* f_odd;
     uint32_t status_reg;
     uint8_t mips3_float_mode;
+    // Set by the runtime when this thread should stop. Live-recompiled code checks this after
+    // every call out and returns through its own epilogue if it's set, instead of being unwound
+    // through by an exception.
+    uint8_t thread_terminate_requested;
 } recomp_context;
 
 // Checks if the target is an even float register or that mips3 float mode is enabled

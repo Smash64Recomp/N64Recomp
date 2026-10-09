@@ -68,6 +68,9 @@ struct N64Recomp::LiveGeneratorContext {
     std::unordered_multimap<size_t, sljit_jump*> import_jumps_by_index;
     std::vector<SwitchErrorJump> switch_error_jumps;
     sljit_jump* cur_branch_jump;
+    // Jumps from mid-function thread-terminate checks, see emit_check_thread_terminate_requested.
+    // Resolved to one shared return in emit_function_end instead of returning inline at each site.
+    std::vector<sljit_jump*> thread_terminate_requested_jumps;
 };
 
 N64Recomp::LiveGenerator::LiveGenerator(size_t num_funcs, const LiveGeneratorInputs& inputs) : inputs(inputs) {
@@ -1323,6 +1326,17 @@ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_n
 }
 
 void N64Recomp::LiveGenerator::emit_function_end() const {
+    // Mid-function thread-terminate checks (emit_check_thread_terminate_requested) jump here
+    // instead of returning inline, so they all share this one real return point.
+    if (!context->thread_terminate_requested_jumps.empty()) {
+        sljit_label* terminate_now = sljit_emit_label(compiler);
+        for (sljit_jump* jump : context->thread_terminate_requested_jumps) {
+            sljit_set_label(jump, terminate_now);
+        }
+        sljit_emit_return_void(compiler);
+        context->thread_terminate_requested_jumps.clear();
+    }
+
     // Check that all jumps have been paired to a label.
     if (!context->pending_jumps.empty()) {
         assert(false);
@@ -1365,6 +1379,27 @@ void N64Recomp::LiveGenerator::emit_function_end() const {
     }
 }
 
+// Checked after every call out of a live function. A thread can be asked to stop while this
+// frame is on the stack; rather than unwind an exception through it (no unwind info for the host
+// OS to read), this returns through the function's own epilogue, same as reaching its own
+// `jr $ra`. Every live frame always leaves by an ordinary return. The native frame above the
+// topmost live one sees the call return this way and throws from there, which is safe since
+// everything above it is compiler-generated code with real unwind info.
+//
+// Doesn't inline the return at the check site: a label placed right after an inlined return, with
+// more real code following, got miscompiled (the jump landed on a second copy of the return
+// instead of falling through), so every check just pushes a jump and emit_function_end resolves
+// them all to one shared return.
+static void emit_check_thread_terminate_requested(sljit_compiler* compiler, N64Recomp::LiveGeneratorContext* context) {
+    // thread_terminate_requested is the last byte of recomp_context; load just the byte, a word
+    // load would read 7 bytes past the struct. R0-R3 are already clobbered by the call that just
+    // happened, so one is free to use as scratch here.
+    sljit_emit_op1(compiler, SLJIT_MOV_U8, SLJIT_R0, 0,
+        SLJIT_MEM1(Registers::ctx), offsetof(recomp_context, thread_terminate_requested));
+    sljit_jump* requested = sljit_emit_cmp(compiler, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+    context->thread_terminate_requested_jumps.push_back(requested);
+}
+
 void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
     // Load the address immediate into the first argument. 
     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, int32_t(addr));
@@ -1381,6 +1416,7 @@ void N64Recomp::LiveGenerator::emit_function_call_lookup(uint32_t addr) const {
 
     // Call the function.
     sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
+    emit_check_thread_terminate_requested(compiler, context.get());
 }
 
 void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
@@ -1399,6 +1435,7 @@ void N64Recomp::LiveGenerator::emit_function_call_by_register(int reg) const {
 
     // Call the function.
     sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P), SLJIT_R3, 0);
+    emit_check_thread_terminate_requested(compiler, context.get());
 }
 
 void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context&, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
@@ -1425,6 +1462,7 @@ void N64Recomp::LiveGenerator::emit_function_call_reference_symbol(const Context
             call_jump
         ));
     }
+    emit_check_thread_terminate_requested(compiler, context.get());
 }
 
 void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t function_index) const {
@@ -1434,6 +1472,7 @@ void N64Recomp::LiveGenerator::emit_function_call(const Context&, size_t functio
     // Call the function and save the jump to set its label later on.
     sljit_jump* call_jump = sljit_emit_call(compiler, SLJIT_CALL, SLJIT_ARGS2V(P, P));
     context->inner_calls.emplace_back(InnerCall{ .target_func_index = function_index, .jump = call_jump });
+    emit_check_thread_terminate_requested(compiler, context.get());
 }
 
 void N64Recomp::LiveGenerator::emit_named_function_call(const std::string& function_name) const {
@@ -1917,6 +1956,7 @@ void N64Recomp::LiveGenerator::emit_syscall(uint32_t instr_vram) const {
     sljit_emit_op1(compiler, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, instr_vram);
     // Call syscall_handler.
     sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, P, 32), SLJIT_IMM, sljit_sw(inputs.syscall_handler));
+    emit_check_thread_terminate_requested(compiler, context.get());
 }
 
 void N64Recomp::LiveGenerator::emit_do_break(uint32_t instr_vram) const {
