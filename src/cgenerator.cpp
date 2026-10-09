@@ -406,22 +406,34 @@ void N64Recomp::CGenerator::emit_function_end() const {
     fmt::print(output_file, ";}}\n");
 }
 
+// A statically-compiled frame calling this has an ordinary unwind table, so it can't use the
+// live recompiler's jump-to-shared-return trick (see LiveGenerator's version of this check);
+// a plain early return here already unwinds it correctly, cascading up through every static
+// frame until a native caller (e.g. recomp_run_gobj_thread) converts it into a real throw.
+static void emit_check_thread_terminate_requested(std::ostream& output_file) {
+    fmt::print(output_file, "if (ctx->thread_terminate_requested) {{ return; }}\n");
+}
+
 void N64Recomp::CGenerator::emit_function_call_lookup(uint32_t addr) const {
     fmt::print(output_file, "LOOKUP_FUNC(0x{:08X})(rdram, ctx);\n", addr);
+    emit_check_thread_terminate_requested(output_file);
 }
 
 void N64Recomp::CGenerator::emit_function_call_by_register(int reg) const {
     fmt::print(output_file, "LOOKUP_FUNC({})(rdram, ctx);\n", gpr_to_string(reg));
+    emit_check_thread_terminate_requested(output_file);
 }
 
 void N64Recomp::CGenerator::emit_function_call_reference_symbol(const Context& context, uint16_t section_index, size_t symbol_index, uint32_t target_section_offset) const {
     (void)target_section_offset;
     const N64Recomp::ReferenceSymbol& sym = context.get_reference_symbol(section_index, symbol_index);
     fmt::print(output_file, "{}(rdram, ctx);\n", sym.name);
+    emit_check_thread_terminate_requested(output_file);
 }
 
 void N64Recomp::CGenerator::emit_function_call(const Context& context, size_t function_index) const {
     fmt::print(output_file, "{}(rdram, ctx);\n", context.functions[function_index].name);
+    emit_check_thread_terminate_requested(output_file);
 }
 
 void N64Recomp::CGenerator::emit_named_function_call(const std::string& function_name) const {
